@@ -20,13 +20,19 @@
 .PARAMETER Keep
     How many most-recent package versions to list. Default 5.
 
+.PARAMETER WithSizes
+    Resolve real byte sizes for every package version by querying the nuget/npm
+    registries (one lightweight ranged request per version). Off by default because
+    it is network-heavy. When on, per-version sizes, a per-package total across ALL
+    versions, and a repo-wide grand total are shown.
+
 .PARAMETER NonInteractive
     Skip all prompts and use parameter values / defaults as-is. Handy for CI.
 
 .EXAMPLE
     .\repo-report.ps1
 .EXAMPLE
-    .\repo-report.ps1 -Repo my-repo
+    .\repo-report.ps1 -Repo my-repo -WithSizes
 .EXAMPLE
     .\repo-report.ps1 -Repo my-org/web-app -Keep 10
 #>
@@ -35,6 +41,7 @@ param(
     [string]$Repo,
     [string]$Owner,
     [int]$Keep = 5,
+    [switch]$WithSizes,
     [switch]$NonInteractive
 )
 
@@ -49,6 +56,15 @@ function Read-Default {
     $ans = Read-Host ("{0}{1}" -f $Prompt, $shown)
     if ([string]::IsNullOrWhiteSpace($ans)) { return $Default }
     return $ans.Trim()
+}
+
+function Read-YesNo {
+    param([string]$Prompt, [bool]$Default = $false)
+    if (-not $script:Interactive) { return $Default }
+    $hint = if ($Default) { 'Y/n' } else { 'y/N' }
+    $ans = (Read-Host ("{0} [{1}]" -f $Prompt, $hint)).Trim()
+    if ([string]::IsNullOrWhiteSpace($ans)) { return $Default }
+    return $ans -match '^(y|yes)$'
 }
 
 # ---------- helpers ------------------------------------------------------------
@@ -79,6 +95,46 @@ function Fmt-Bytes {
     if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
     if ($Bytes -ge 1KB) { return ('{0:N1} KB' -f ($Bytes / 1KB)) }
     return "$([int]$Bytes) B"
+}
+
+# GitHub's packages API does not expose per-version byte size, but the underlying
+# registries do. We ask for a single byte (Range: bytes=0-0) and read the total
+# size out of the Content-Range header, so we never download the whole artifact.
+function Get-RemoteSize {
+    param([string]$Url, [string]$Token)
+    try {
+        $r = Invoke-WebRequest -Method Get -Uri $Url -Headers @{
+            Authorization = "Bearer $Token"; Range = 'bytes=0-0'
+        } -MaximumRedirection 5 -UseBasicParsing -ErrorAction Stop
+        $cr = ($r.Headers['Content-Range'] -join '')
+        if ($cr -match '/\s*(\d+)\s*$') { return [int64]$Matches[1] }
+        $cl = ($r.Headers['Content-Length'] -join '')   # server ignored Range -> full length
+        if ($cl) { return [int64]$cl }
+    } catch { }
+    return $null
+}
+
+# NuGet download URL: id and version are lowercased (NuGet normalization).
+function Get-NugetVersionUrl {
+    param([string]$Owner, [string]$Id, [string]$Version)
+    $idl = $Id.ToLower(); $verl = $Version.ToLower()
+    return "https://nuget.pkg.github.com/$Owner/download/$idl/$verl/$idl.$verl.nupkg"
+}
+
+# npm: fetch package metadata once and map version -> tarball URL.
+function Get-NpmTarballMap {
+    param([string]$Owner, [string]$Name, [string]$Token)
+    $map = @{}
+    $pkgName = if ($Name.StartsWith('@')) { $Name } else { "@$Owner/$Name" }
+    $url = "https://npm.pkg.github.com/$([uri]::EscapeDataString($pkgName))"
+    try {
+        $m = Invoke-RestMethod -Uri $url -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
+        foreach ($prop in $m.versions.PSObject.Properties) {
+            $t = $prop.Value.dist.tarball
+            if ($t) { $map[$prop.Name] = $t }
+        }
+    } catch { }
+    return $map
 }
 
 function Rule { param([string]$Label = '', [int]$Width = 62)
@@ -114,6 +170,18 @@ if ([string]::IsNullOrWhiteSpace($Repo)) { throw "No repo name provided." }
 
 if (-not $PSBoundParameters.ContainsKey('Keep')) {
     $Keep = [int](Read-Default "How many recent versions/releases/artifacts to list" $Keep)
+}
+if (-not $PSBoundParameters.ContainsKey('WithSizes')) {
+    $WithSizes = [switch](Read-YesNo "Resolve real package sizes? (slower, one request per version)" $false)
+}
+
+$ghToken = $null
+if ($WithSizes) {
+    $ghToken = (& gh auth token 2>$null | Out-String).Trim()
+    if (-not $ghToken) {
+        Write-Host "  ! Could not read a gh token; sizes will show as n/a." -ForegroundColor Yellow
+        $WithSizes = [switch]$false
+    }
 }
 
 # Allow 'owner/name' form.
@@ -209,26 +277,81 @@ Write-Host ''
 
 # ---- Packages / versions ----
 Rule 'Package versions'
+$repoPkgBytes = 0; $repoSizeComplete = $true
 if (-not $pkgScopeOk) {
     Write-Host "  (read:packages scope missing - run: gh auth refresh -h github.com -s read:packages)" -ForegroundColor Yellow
 } elseif ($linkedPkgs.Count -eq 0) {
     Write-Host "  No packages linked to this repo."
 } else {
-    Write-Host ("  NOTE: GitHub's API does not expose per-version byte size for nuget/npm," ) -ForegroundColor DarkYellow
-    Write-Host ("        so version sizes are shown as n/a. 'id' is the version (tag) id." ) -ForegroundColor DarkYellow
+    if ($WithSizes) {
+        Write-Host ("  Sizes are the on-registry artifact size (.nupkg / npm tarball). 'id' is the version id." ) -ForegroundColor DarkYellow
+    } else {
+        Write-Host ("  NOTE: sizes shown as n/a. Re-run with -WithSizes to resolve real sizes and totals." ) -ForegroundColor DarkYellow
+        Write-Host ("        'id' is the version (tag) id." ) -ForegroundColor DarkYellow
+    }
     foreach ($pk in $linkedPkgs) {
         Write-Host ''
         Write-Host ("  {0}  [{1}]  total versions: {2}" -f $pk.Name, $pk.Type, $pk.Versions) -ForegroundColor Cyan
-        $vers = Gh-Json @('api', "users/$Owner/packages/$($pk.Type)/$($pk.Name)/versions?per_page=$Keep") -Quiet
-        if ($vers) {
-            $i = 0
-            foreach ($v in ($vers | Select-Object -First $Keep)) {
-                $i++
-                $tag = if ($i -eq 1) { ' <-- latest' } else { '' }
-                Write-Host ("    {0,2}. {1,-12} id={2,-12} {3:yyyy-MM-dd}  size=n/a{4}" -f `
-                    $i, $v.name, $v.id, ([datetime]$v.created_at), $tag)
-            }
+
+        # When resolving sizes we need every version to total the package; otherwise
+        # the top-Keep page is enough for display.
+        $vers = if ($WithSizes) {
+            Gh-Json @('api', '--paginate', "users/$Owner/packages/$($pk.Type)/$($pk.Name)/versions") -Quiet
+        } else {
+            Gh-Json @('api', "users/$Owner/packages/$($pk.Type)/$($pk.Name)/versions?per_page=$Keep") -Quiet
         }
+        if (-not $vers) { continue }
+        $vers = @($vers | Sort-Object { [datetime]$_.created_at } -Descending)
+
+        # npm needs a version -> tarball map (one metadata request per package).
+        $npmMap = $null
+        if ($WithSizes -and $pk.Type -eq 'npm') {
+            $npmMap = Get-NpmTarballMap -Owner $Owner -Name $pk.Name -Token $ghToken
+        }
+
+        # Resolve size for every version (used for the package total).
+        $sizes = @{}
+        $pkgBytes = 0; $pkgSizeComplete = $true
+        if ($WithSizes) {
+            $done = 0
+            foreach ($v in $vers) {
+                $done++
+                Write-Progress -Activity "Sizing $($pk.Name)" -Status "$done/$($vers.Count) ($($v.name))" `
+                    -PercentComplete ([int](100 * $done / [Math]::Max(1, $vers.Count)))
+                $url = if ($pk.Type -eq 'nuget') {
+                    Get-NugetVersionUrl -Owner $Owner -Id $pk.Name -Version $v.name
+                } elseif ($npmMap) { $npmMap[$v.name] } else { $null }
+                $sz = if ($url) { Get-RemoteSize -Url $url -Token $ghToken } else { $null }
+                $sizes[$v.id] = $sz
+                if ($null -ne $sz) { $pkgBytes += $sz } else { $pkgSizeComplete = $false }
+            }
+            Write-Progress -Activity "Sizing $($pk.Name)" -Completed
+        }
+
+        $i = 0
+        foreach ($v in ($vers | Select-Object -First $Keep)) {
+            $i++
+            $tag = if ($i -eq 1) { ' <-- latest' } else { '' }
+            $szTxt = if (-not $WithSizes) { 'n/a' }
+                     elseif ($null -ne $sizes[$v.id]) { Fmt-Bytes $sizes[$v.id] }
+                     else { 'n/a' }
+            Write-Host ("    {0,2}. {1,-12} id={2,-12} {3:yyyy-MM-dd}  size={4,-10}{5}" -f `
+                $i, $v.name, $v.id, ([datetime]$v.created_at), $szTxt, $tag)
+        }
+
+        if ($WithSizes) {
+            $flag = if ($pkgSizeComplete) { '' } else { '  (some versions unresolved)' }
+            Write-Host ("       package total ({0} version(s)): {1}{2}" -f `
+                $vers.Count, (Fmt-Bytes $pkgBytes), $flag) -ForegroundColor DarkCyan
+            $repoPkgBytes += $pkgBytes
+            if (-not $pkgSizeComplete) { $repoSizeComplete = $false }
+        }
+    }
+    if ($WithSizes) {
+        Write-Host ''
+        $flag = if ($repoSizeComplete) { '' } else { '  (incomplete — some versions could not be sized)' }
+        Write-Host ("  All packages in this repo - total size: {0}{1}" -f `
+            (Fmt-Bytes $repoPkgBytes), $flag) -ForegroundColor Green
     }
 }
 Write-Host ''
