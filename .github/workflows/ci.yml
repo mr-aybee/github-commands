@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse and lint PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem -Filter *.ps1 -Recurse) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs) { $errs | ForEach-Object { Write-Error "$($f.Name): $_" }; $failed = $true }
+          }
+          Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error -EnableExit
+          if ($failed) { exit 1 }
